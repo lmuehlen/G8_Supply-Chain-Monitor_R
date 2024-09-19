@@ -16,6 +16,8 @@ library(lubridate)
 library(tidyverse)
 library(rdbnomics)
 library(slider)
+library(devtools)
+usethis::use_github()
 ```
 
 # Functions bacs
