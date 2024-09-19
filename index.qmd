@@ -1,0 +1,273 @@
+---
+title: G8_Supply Chain Monitor_R
+authors:
+  - name: Leonard Mühlenweg
+    affiliation: Dezernat Zukunft
+    roles: writing
+    corresponding: true
+bibliography: references.bib
+---
+
+# Packagaes
+
+```{r}
+library(readxl)
+library(lubridate)
+library(tidyverse)
+library(rdbnomics)
+library(slider)
+```
+
+# Functions bacs
+```{r}
+formating_bacs<-function(x){
+names<-read_xlsx("Data/names_subsectors.xlsx",col_types = c("text","text"))  
+  data<-x%>%select(time=1, where(~ !is.logical(.)))%>%
+    mutate(across(-time,~as.numeric(.)))
+
+if(!grepl("BUIL", names(data)[2])){
+   data<-data%>%mutate(time = time%>%
+           str_replace("Q1", "01") %>%
+           str_replace("Q2", "04") %>%
+           str_replace("Q3", "07") %>%
+           str_replace("Q4", "10")%>%ym())
+}
+  
+  data2<-data%>%
+  pivot_longer(-time,names_pattern = "(.*)\\.(.*)\\.(.*)\\.(.*)\\.(.*)\\.(.*)",names_to = c("NASC","country","subsector_number","question","subquestion","periodicity"))%>%
+   pivot_wider(values_from = value,names_from = subquestion)%>%
+     select(
+       NASC,
+       time,
+       country,
+       subsector_number,
+       question,
+       periodicity,
+       "limfactors_none"=F1S,
+       "limfactors_demand"=F2S,
+       "limfactors_labour"=F3S,
+       "limfactors_shortages"=F4S,
+       "limfactors_other"=F5S,
+       "limfactors_financial"=F6S)
+
+if(data2$NASC[1]=="SERV"){
+  data2<-data2%>%filter(question==7)
+}
+  
+if(data2$NASC[1]=="BUIL"){
+  data2<-data2%>%filter(question==2)
+}  
+  
+data2%>%select(-question)%>%left_join(names,by="subsector_number")  
+}
+```
+
+```{r}
+#seasonally adjusted data
+#https://economy-finance.ec.europa.eu/economic-forecast-and-surveys/business-and-consumer-surveys/download-business-and-consumer-survey-data/subsector-data_en
+
+download_and_process_bacs<-function(){
+yymm<-Sys.Date() %m-% months(1)%>%format("%y%m")
+
+download.file(paste0("https://ec.europa.eu/economy_finance/db_indicators/surveys/documents/series/nace2_ecfin_",yymm,"/industry_subsectors_sa_nace2.zip"),"Data/bacs_industry_sub.zip")
+unzip("Data/bacs_industry_sub.zip",exdir="Data")
+
+download.file(paste0("https://ec.europa.eu/economy_finance/db_indicators/surveys/documents/series/nace2_ecfin_",yymm,"/services_subsectors_sa_nace2.zip"),"Data/bacs_service_sub.zip")
+unzip("Data/bacs_service_sub.zip",exdir="Data")
+
+download.file(paste0("https://ec.europa.eu/economy_finance/db_indicators/surveys/documents/series/nace2_ecfin_",yymm,"/building_subsectors_sa_nace2.zip"),"Data/bacs_construction_sub.zip")
+unzip("Data/bacs_construction_sub.zip",exdir="Data")
+
+industry_list<-lapply(3:26,function(x) read_xlsx("Data/industry_subsectors_sa_q8_nace2.xlsx",sheet=x))
+service_list<-lapply(3:39,function(x) read_xlsx("Data/services_subsectors_sa_q_nace2.xlsx",sheet=x))
+construction_list<-suppressMessages(lapply(3:5,function(x) read_xlsx("Data/building_subsectors_sa_m_nace2.xlsx",sheet=x)))
+
+
+
+#Process industry, construction and service data unsing formating_bacs
+data_industry<-industry_list%>%map(formating_bacs)%>%bind_rows()
+data_construction<-construction_list%>%map(formating_bacs)%>%bind_rows()
+data_service<-service_list%>%map(formating_bacs)%>%bind_rows
+
+data_bacs<-bind_rows(list(data_industry,data_construction,data_service))
+data_bacs
+}
+
+
+```
+
+# Functions sts
+```{r}
+formating_sts<-function(x){
+name<-read_xlsx("Data/names_subsectors.xlsx",col_types = c("text","text")) 
+
+x%>%mutate(nace_r2=substring(nace_r2,2))%>%left_join(name,.,by=c("subsector_number"="nace_r2"))%>%select(subsector_number,subsector,dataset_code,dataset_name,geo,period,value)
+}
+```
+
+```{r}
+
+compute_rolling_avg_change <- function(df, 
+                                       period_col = "period", 
+                                       value_col = "value", 
+                                       group_cols = c("subsector_number", "geo"),
+                                       window_size_months = 3, 
+                                       num_prev_years = 3) {
+
+  # Ensure the period column is of Date type and geo is non-empty
+  df <- df %>%
+    mutate(
+      !!period_col := as.Date(.data[[period_col]])
+    )%>%filter(!is.na(geo))
+  
+  # Compute the rolling average over the specified window size
+  df <- df %>%
+    arrange(across(all_of(c(group_cols, period_col)))) %>%
+    group_by(across(all_of(group_cols))) %>%
+    mutate(
+      rolling_avg = slide_index_dbl(
+        .x = .data[[value_col]],
+        .i = .data[[period_col]],
+        .f = ~ mean(.x, na.rm = TRUE),
+        .before = months(window_size_months - 1),
+        .complete = TRUE
+      )
+    ) %>%
+    ungroup()
+  
+  # Create a lookup table for rolling averages
+  lookup_table <- df %>%
+    select(all_of(group_cols), !!period_col, rolling_avg)
+  
+  # Generate previous periods
+  for (i in 1:num_prev_years) {
+    df <- df %>%
+      mutate(
+        !!paste0("period_prev", i) := .data[[period_col]] %m-% years(i)
+      )
+  }
+  
+  # Merge previous years' rolling averages
+  for (i in 1:num_prev_years) {
+    df <- df %>%
+      left_join(
+        lookup_table %>% 
+          rename(
+            !!paste0("period_prev", i) := all_of(period_col),
+            !!paste0("rolling_avg_prev", i) := rolling_avg
+          ),
+        by = c(setNames(group_cols, group_cols), paste0("period_prev", i))
+      )
+  }
+  
+  # Compute the average of previous years' rolling averages
+  df <- df %>%
+    rowwise() %>%
+    mutate(
+      avg_prev_years_rolling_avg = mean(
+        c_across(starts_with("rolling_avg_prev")),
+        na.rm = FALSE
+      ),
+      # Compute the change compared to previous years
+      percentage_change_vs_prev_years = ifelse(
+        !is.na(avg_prev_years_rolling_avg) & avg_prev_years_rolling_avg != 0,
+        ((rolling_avg - avg_prev_years_rolling_avg) / avg_prev_years_rolling_avg) * 100,
+        NA_real_
+      )
+    ) %>%
+    ungroup()
+  
+  df%>%select(-c(value,rolling_avg,rolling_avg_prev1,rolling_avg_prev2,rolling_avg_prev3,period_prev1,period_prev2,period_prev3,avg_prev_years_rolling_avg))%>%filter(period>="2000-01-01")
+}
+```
+
+```{r}
+
+get_sts<-function(dataset_code,mask,type){
+ rdb("Eurostat",dataset_code,mask)%>%
+    formating_sts()%>%
+    compute_rolling_avg_change()%>%
+    mutate(area=type)
+}
+
+```
+
+
+#Actual processing
+```{r}
+
+data_bacs<-download_and_process_bacs()
+
+data_bacs%>%
+  filter(NASC=="INDU",country=="DE")%>%
+  ggplot(aes(time,limfactors_shortages,color=subsector))+
+  geom_line()
+```
+
+
+```{r}
+data_inpp<-get_sts("sts_inpp_m","M.PRC_PRR..NSA.I21.","industry")
+data_inpr<-get_sts("sts_inpr_m","M.PRD..NSA.I21.")
+data_copr<-get_sts("sts_copr_m","M.PRD..NSA.I21.")
+#data_copi<-get_sts("sts_copi_m","M.PRC_PRR..NSA.I21.")
+data_sepp<-get_sts("sts_sepp_q","Q.PRC_PRR..NSA.I21.")
+data_sepr<-get_sts("sts_sepr_m","M.PRD..NSA.I21.")
+
+
+
+data_list<-list(data_inpp,data_inpr,data_copr,data_sepp,data_sepr)
+
+data_sts<-do.call("rbind",data_list)
+data_sts2<-data_sts%>%
+  select(-dataset_name)%>%
+  pivot_wider(names_from = "dataset_code",values_from = "percentage_change_vs_prev_years")
+
+
+
+```
+
+
+
+# Archiv
+```{r}
+data_sts<- rdb("Eurostat","sts_inpp_m",mask="M.PRC_PRR..NSA.I21.")
+
+data_sts2<-data_sts%>%mutate(nace_r2=substring(nace_r2,2))%>%left_join(names,.,by=c("subsector_number"="nace_r2"))%>%select(subsector_number,subsector,dataset_code,dataset_name,geo,period,value)
+
+
+data_inpr<- rdb("Eurostat","sts_inpr_m",mask="M.PRD..NSA.I21.")
+
+
+
+data_inpr2<-formating_sts(data_inpr)
+
+
+data_inpr3<-data_inpr2%>%
+  filter(!is.na(geo))%>%
+  arrange(subsector_number, geo, period) %>%
+  group_by(subsector_number, geo) %>%
+  mutate(
+    rolling_avg_3months = slide_period_dbl(
+      .x = value,
+      .i = period,
+      .period = "month",
+      .before = 2,
+      .f = ~ mean(.x, na.rm = TRUE),
+      .complete = TRUE
+    ),
+     avg_prev3years_rolling_avg = map_dbl(period, ~ {
+      prev_periods <- c(.x %m-% years(1), .x %m-% years(2), .x %m-% years(3))
+      prev_avgs <- rolling_avg_3months[period %in% prev_periods]
+      mean(prev_avgs, na.rm = FALSE)
+    })
+  )
+
+data_inpr2$period
+map_dbl(data_inpr2$period, ~ {
+      prev_periods <- c(.x %m-% years(1), .x %m-% years(2), .x %m-% years(3))
+      #prev_avgs <- rolling_avg_3months[period %in% prev_periods]
+      #data<-mean(prev_avgs, na.rm = FALSE)
+    prev_periods[1]
+    })
+```
+
